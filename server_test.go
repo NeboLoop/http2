@@ -1,6 +1,8 @@
 package http2
 
 import (
+	"bufio"
+	"fmt"
 	"io"
 	"net"
 	"strconv"
@@ -240,6 +242,90 @@ func TestIssue27(t *testing.T) {
 		}
 
 		id += 2
+	}
+}
+
+// TestChunkedResponseEndStream verifies that responses with unknown content length
+// (SetBodyStreamWriter, i.e. chunked HTTP/1.1 proxied to HTTP/2) correctly send
+// END_STREAM on the final DATA frame.
+func TestChunkedResponseEndStream(t *testing.T) {
+	responseBody := `{"status":"ok","message":"hello world"}`
+
+	s := &Server{
+		s: &fasthttp.Server{
+			Handler: func(ctx *fasthttp.RequestCtx) {
+				// Simulate a chunked response (no Content-Length) by using SetBodyStreamWriter.
+				// This is what happens when a reverse proxy forwards a backend response
+				// that has Transfer-Encoding: chunked.
+				ctx.Response.Header.SetContentType("application/json")
+				ctx.SetBodyStreamWriter(func(w *bufio.Writer) {
+					fmt.Fprint(w, responseBody)
+					w.Flush()
+				})
+			},
+			ReadTimeout: time.Second * 5,
+		},
+		cnf: ServerConfig{
+			Debug: false,
+		},
+	}
+
+	c, ln, err := getConn(s)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer c.Close()
+	defer ln.Close()
+
+	h1 := makeHeaders(3, c.enc, true, true, map[string]string{
+		string(StringAuthority): "localhost",
+		string(StringMethod):    "GET",
+		string(StringPath):      "/api/test",
+		string(StringScheme):    "https",
+	})
+
+	c.writeFrame(h1)
+
+	// Read HEADERS frame
+	fr, err := c.readNext()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if fr.Type() != FrameHeaders {
+		t.Fatalf("expected HEADERS frame, got %s", fr.Type())
+	}
+	if fr.Flags().Has(FlagEndStream) {
+		t.Fatal("HEADERS should not have END_STREAM (response has body)")
+	}
+
+	// Read DATA frame(s) — collect body and check for END_STREAM
+	var gotEndStream bool
+	var totalBody []byte
+
+	for i := 0; i < 10; i++ { // safety limit
+		fr, err = c.readNext()
+		if err != nil {
+			t.Fatal(err)
+		}
+		if fr.Type() != FrameData {
+			t.Fatalf("expected DATA frame, got %s", fr.Type())
+		}
+
+		data := fr.Body().(*Data)
+		totalBody = append(totalBody, data.Data()...)
+
+		if data.EndStream() {
+			gotEndStream = true
+			break
+		}
+	}
+
+	if !gotEndStream {
+		t.Fatal("never received END_STREAM on DATA frame — browser would hang forever")
+	}
+
+	if string(totalBody) != responseBody {
+		t.Fatalf("body mismatch: got %q, want %q", string(totalBody), responseBody)
 	}
 }
 

@@ -823,6 +823,21 @@ func (sc *serverConn) handleEndRequest(strm *Stream) {
 			streamWriter.writer = sc.writer
 			streamWriter.size = int64(ctx.Response.Header.ContentLength())
 			_ = ctx.Response.BodyWriteTo(streamWriter)
+
+			// For unknown-length streams (chunked), neither ReadFrom nor Write
+			// can reliably set END_STREAM because they don't know when the last
+			// chunk arrives. Send an empty DATA frame with END_STREAM after all
+			// body data has been written.
+			if streamWriter.size < 0 && !streamWriter.endStreamSent {
+				fr := AcquireFrameHeader()
+				fr.SetStream(strm.ID())
+				data := AcquireFrame(FrameData).(*Data)
+				data.SetEndStream(true)
+				data.SetPadding(false)
+				fr.SetBody(data)
+				sc.writer <- fr
+			}
+
 			releaseStreamWrite(streamWriter)
 		} else {
 			sc.writeData(strm, ctx.Response.Body())
@@ -844,10 +859,11 @@ var (
 )
 
 type streamWrite struct {
-	size    int64
-	written int64
-	strm    *Stream
-	writer  chan<- *FrameHeader
+	size          int64
+	written       int64
+	endStreamSent bool
+	strm          *Stream
+	writer        chan<- *FrameHeader
 }
 
 func acquireStreamWrite() *streamWrite {
@@ -866,12 +882,16 @@ func releaseStreamWrite(streamWrite *streamWrite) {
 func (s *streamWrite) Reset() {
 	s.size = 0
 	s.written = 0
+	s.endStreamSent = false
 	s.strm = nil
 	s.writer = nil
 }
 
 func (s *streamWrite) Write(body []byte) (n int, err error) {
-	if (s.size <= 0 && s.written > 0) || (s.size > 0 && s.written >= s.size) {
+	if s.endStreamSent {
+		return 0, errors.New("writer closed")
+	}
+	if s.size > 0 && s.written >= s.size {
 		return 0, errors.New("writer closed")
 	}
 
@@ -880,7 +900,9 @@ func (s *streamWrite) Write(body []byte) (n int, err error) {
 	n = len(body)
 	s.written += int64(n)
 
-	end := s.size < 0 || s.written >= s.size
+	// Only set END_STREAM for known-length streams where we've written enough.
+	// Unknown-length streams (size < 0) get END_STREAM from handleEndRequest.
+	end := s.size > 0 && s.written >= s.size
 	for i := 0; i < n; i += step {
 		if i+step >= n {
 			step = n - i
@@ -897,6 +919,10 @@ func (s *streamWrite) Write(body []byte) (n int, err error) {
 		fr.SetBody(data)
 
 		s.writer <- fr
+	}
+
+	if end {
+		s.endStreamSent = true
 	}
 
 	return len(body), nil
@@ -919,23 +945,30 @@ func (s *streamWrite) ReadFrom(r io.Reader) (num int64, err error) {
 			err = errors.New("BUG: io.Reader returned 0, nil")
 		}
 
-		if err != nil {
-			break
+		// Process data before checking error — io.Reader may return
+		// n > 0 with err = io.EOF on the final read.
+		if n > 0 {
+			isLast := s.size >= 0 && num+int64(n) >= s.size
+
+			fr := AcquireFrameHeader()
+			fr.SetStream(s.strm.ID())
+
+			data := AcquireFrame(FrameData).(*Data)
+			data.SetEndStream(isLast)
+			data.SetPadding(false)
+			data.SetData(buf[:n])
+			fr.SetBody(data)
+
+			s.writer <- fr
+
+			num += int64(n)
+			if isLast {
+				s.endStreamSent = true
+				break
+			}
 		}
 
-		fr := AcquireFrameHeader()
-		fr.SetStream(s.strm.ID())
-
-		data := AcquireFrame(FrameData).(*Data)
-		data.SetEndStream(err != nil || (s.size >= 0 && num+int64(n) >= s.size))
-		data.SetPadding(false)
-		data.SetData(buf[:n])
-		fr.SetBody(data)
-
-		s.writer <- fr
-
-		num += int64(n)
-		if s.size >= 0 && num >= s.size {
+		if err != nil {
 			break
 		}
 	}
