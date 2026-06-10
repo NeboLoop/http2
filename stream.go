@@ -49,6 +49,20 @@ type Stream struct {
 	origType        FrameType
 	startedAt       time.Time
 	headersFinished bool
+
+	// processing is true while the request handler runs in its own
+	// goroutine. Owned by the handleStreams loop.
+	processing bool
+
+	// sendQuota tracks send flow-control credit relative to the client's
+	// SETTINGS_INITIAL_WINDOW_SIZE: WINDOW_UPDATEs add, DATA sends subtract.
+	// Available window = initialStreamWin + sendQuota. Guarded by
+	// serverConn.fcMu.
+	sendQuota int64
+
+	// cancelled tells the handler goroutine to stop writing (stream was
+	// reset or the connection is closing). Guarded by serverConn.fcMu.
+	cancelled bool
 }
 
 var streamPool = sync.Pool{
@@ -69,6 +83,9 @@ func NewStream(id uint32, win int32) *Stream {
 	strm.scheme = []byte("https")
 	strm.origType = 0
 	strm.headerBlockNum = 0
+	strm.processing = false
+	strm.sendQuota = 0
+	strm.cancelled = false
 
 	return strm
 }

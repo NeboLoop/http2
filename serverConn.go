@@ -25,6 +25,12 @@ const (
 	connStateClosed
 )
 
+// errRequestBodyTooLarge signals that a stream's accumulated request body
+// exceeded maxBodySize. Handled by responding 413 + RST_STREAM(NO_ERROR)
+// rather than a bare reset: clients surface the HTTP error instead of
+// retrying (x/net retries PROTOCOL_ERROR and REFUSED_STREAM resets).
+var errRequestBodyTooLarge = errors.New("request body too large")
+
 type serverConn struct {
 	c net.Conn
 	h fasthttp.RequestHandler
@@ -38,13 +44,41 @@ type serverConn struct {
 	// last valid ID used as a reference for new IDs
 	lastID uint32
 
-	// client's window
-	// should be int64 because the user can try to overflow it
-	clientWindow int64
+	// Send-side flow control (server -> client). All guarded by fcMu;
+	// fcCond is broadcast whenever credit arrives, the client's initial
+	// window changes, a stream is cancelled, or the connection starts
+	// closing — waking any handler goroutine blocked in acquireSendCredit.
+	fcMu             sync.Mutex
+	fcCond           *sync.Cond
+	connSendQuota    int64 // connection-level send window
+	initialStreamWin int64 // client's SETTINGS_INITIAL_WINDOW_SIZE
+	closing          bool  // connection is shutting down
 
 	// our values
 	maxWindow     int32
 	currentWindow int32
+
+	// hpackMu serializes response header encoding: the HPACK encoder is
+	// stateful, so header blocks must be encoded and enqueued to the writer
+	// in the same order.
+	hpackMu sync.Mutex
+
+	// writerMu guards writer against send-after-close: senders hold RLock,
+	// closeWriter takes Lock.
+	writerMu     sync.RWMutex
+	writerClosed bool
+
+	// handlersWG tracks in-flight request handler goroutines.
+	handlersWG sync.WaitGroup
+
+	// done receives streams whose handler goroutine finished, so the
+	// handleStreams loop can release them. Buffered to maxStreams so
+	// handlers never block on it.
+	done chan *Stream
+
+	// activeStreams counts open request streams, including those whose
+	// handler is still running. Read by the idle timer goroutine.
+	activeStreams int32
 
 	writer chan *FrameHeader
 	reader chan *FrameHeader
@@ -64,6 +98,10 @@ type serverConn struct {
 	// Therefore, a client that didn't send a request for more than `maxIdleTime` will see it's connection closed.
 	maxIdleTime time.Duration
 
+	// maxBodySize limits the accumulated request body per stream
+	// (fasthttp.Server.MaxRequestBodySize). 0 disables the limit.
+	maxBodySize int
+
 	st      Settings
 	clientS Settings
 
@@ -79,6 +117,14 @@ type serverConn struct {
 }
 
 func (sc *serverConn) closeIdleConn() {
+	// "Idle" means no new requests — but long-lived streams (SSE, gRPC
+	// streaming) are still doing useful work without ever starting a new
+	// request. Never close a connection with active streams.
+	if atomic.LoadInt32(&sc.activeStreams) > 0 {
+		sc.maxIdleTimer.Reset(sc.maxIdleTime)
+		return
+	}
+
 	sc.writeGoAway(0, NoError, "connection has been idle for a long time")
 	if sc.debug {
 		sc.logger.Printf("Connection is idle. Closing\n")
@@ -93,10 +139,20 @@ func (sc *serverConn) Handshake() error {
 func (sc *serverConn) Serve() error {
 	sc.closer = make(chan struct{}, 1)
 	sc.maxRequestTimer = time.NewTimer(0)
-	sc.clientWindow = int64(sc.clientS.MaxWindowSize())
+	sc.fcCond = sync.NewCond(&sc.fcMu)
+	sc.connSendQuota = int64(defaultWindowSize)
+	sc.initialStreamWin = int64(sc.clientS.MaxWindowSize())
+	sc.done = make(chan *Stream, sc.st.maxStreams)
 
 	if sc.maxIdleTime > 0 {
 		sc.maxIdleTimer = time.AfterFunc(sc.maxIdleTime, sc.closeIdleConn)
+	}
+
+	// Created here, before any goroutine that stops it, to avoid a nil
+	// deref when handleStreams returns before writeLoop ran (#55 and the
+	// init race that came with that fix).
+	if sc.pingInterval > 0 {
+		sc.pingTimer = time.AfterFunc(sc.pingInterval, sc.sendPingAndSchedule)
 	}
 
 	defer func() {
@@ -114,13 +170,35 @@ func (sc *serverConn) Serve() error {
 		sc.writeLoop()
 	}()
 
+	streamsDone := make(chan struct{})
+
 	go func() {
 		sc.handleStreams()
-		// Fix #55: The pingTimer fired while we were closing the connection.
-		sc.pingTimer.Stop()
-		// close the writer here to ensure that no pending requests
-		// are writing to a closed channel
-		close(sc.writer)
+		if sc.pingTimer != nil {
+			sc.pingTimer.Stop()
+		}
+		close(streamsDone)
+
+		// Keep draining the reader until readLoop closes it, so readLoop
+		// never blocks sending to a loop that already exited (e.g. after
+		// an idle-connection GOAWAY).
+		for fr := range sc.reader {
+			ReleaseFrameHeader(fr)
+		}
+	}()
+
+	go func() {
+		<-streamsDone
+
+		// Wake handler goroutines blocked on flow-control credit and let
+		// them unwind before the writer closes.
+		sc.fcMu.Lock()
+		sc.closing = true
+		sc.fcMu.Unlock()
+		sc.fcCond.Broadcast()
+
+		sc.handlersWG.Wait()
+		sc.closeWriter()
 	}()
 
 	defer func() {
@@ -148,6 +226,31 @@ func (sc *serverConn) Serve() error {
 	return err
 }
 
+// push enqueues a frame for writing unless the writer is already closed.
+// Reports whether the frame was enqueued; on false the frame is released.
+func (sc *serverConn) push(fr *FrameHeader) bool {
+	sc.writerMu.RLock()
+	defer sc.writerMu.RUnlock()
+
+	if sc.writerClosed {
+		ReleaseFrameHeader(fr)
+		return false
+	}
+
+	sc.writer <- fr
+
+	return true
+}
+
+func (sc *serverConn) closeWriter() {
+	sc.writerMu.Lock()
+	if !sc.writerClosed {
+		sc.writerClosed = true
+		close(sc.writer)
+	}
+	sc.writerMu.Unlock()
+}
+
 func (sc *serverConn) close() {
 	if sc.pingTimer != nil {
 		sc.pingTimer.Stop()
@@ -165,7 +268,7 @@ func (sc *serverConn) handlePing(ping *Ping) {
 	ping.SetAck(true)
 	fr.SetBody(ping)
 
-	sc.writer <- fr
+	sc.push(fr)
 }
 
 func (sc *serverConn) writePing() {
@@ -176,7 +279,7 @@ func (sc *serverConn) writePing() {
 
 	fr.SetBody(ping)
 
-	sc.writer <- fr
+	sc.push(fr)
 }
 
 func (sc *serverConn) checkFrameWithStream(fr *FrameHeader) error {
@@ -241,8 +344,15 @@ func (sc *serverConn) readLoop() (err error) {
 				continue
 			}
 
-			if atomic.AddInt64(&sc.clientWindow, win) >= 1<<31-1 {
+			sc.fcMu.Lock()
+			sc.connSendQuota += win
+			overflow := sc.connSendQuota >= 1<<31-1
+			sc.fcMu.Unlock()
+
+			if overflow {
 				sc.writeGoAway(0, FlowControlError, "window is above limits")
+			} else {
+				sc.fcCond.Broadcast()
 			}
 		case FramePing:
 			ping := fr.Body().(*Ping)
@@ -284,6 +394,7 @@ func (sc *serverConn) handleStreams() {
 	closeStream := func(strm *Stream) {
 		if strm.origType == FrameHeaders {
 			openStreams--
+			atomic.AddInt32(&sc.activeStreams, -1)
 		}
 
 		strmID := strm.ID()
@@ -299,6 +410,42 @@ func (sc *serverConn) handleStreams() {
 		}
 	}
 
+	// cancelStream tells a stream's handler goroutine to stop writing.
+	// The stream itself is released later, when the handler signals done.
+	cancelStream := func(strm *Stream) {
+		sc.fcMu.Lock()
+		strm.cancelled = true
+		sc.fcMu.Unlock()
+		sc.fcCond.Broadcast()
+	}
+
+	// goAwayComplete reports whether a GOAWAY was sent and every stream the
+	// GOAWAY promised to finish (ID <= closeRef) has now completed, meaning
+	// the connection can be torn down. Checked after both frame handling
+	// and handler completions — with async handlers, the last promised
+	// stream usually finishes via sc.done, not via a frame.
+	goAwayComplete := func() bool {
+		if atomic.LoadInt32((*int32)(&sc.state)) != int32(connStateClosed) {
+			return false
+		}
+
+		ref := atomic.LoadUint32(&sc.closeRef)
+		// if there's no reference, then just close the connection
+		if ref == 0 {
+			return true
+		}
+
+		// if we have a ref, then check that all streams previous to that ref are closed
+		for _, strm := range strms {
+			// if the stream is here, then it's not closed yet
+			if strm.origType == FrameHeaders && strm.ID() <= ref {
+				return false
+			}
+		}
+
+		return true
+	}
+
 loop:
 	for {
 		select {
@@ -307,7 +454,11 @@ loop:
 		case <-sc.maxRequestTimer.C:
 			reqTimerArmed = false
 
-			deleteUntil := 0
+			// maxRequestTime is a read timeout: it only applies to streams
+			// still receiving their request. Streams whose handler is
+			// already running (long responses, SSE, gRPC streaming) are
+			// never timed out here — the handler owns its own lifetime.
+			var due []*Stream
 			for _, strm := range strms {
 				// the request is due if the startedAt time + maxRequestTime is in the past
 				isDue := time.Now().After(
@@ -316,12 +467,14 @@ loop:
 					break
 				}
 
-				deleteUntil++
+				if strm.processing {
+					continue
+				}
+
+				due = append(due, strm)
 			}
 
-			for deleteUntil > 0 {
-				strm := strms[0]
-
+			for _, strm := range due {
 				if sc.debug {
 					sc.logger.Printf("Stream timed out: %d\n", strm.ID())
 				}
@@ -330,8 +483,6 @@ loop:
 				// set the state to closed in case it comes back to life later
 				strm.SetState(StreamStateClosed)
 				closeStream(strm)
-
-				deleteUntil--
 			}
 
 			if len(strms) != 0 && sc.maxRequestTime > 0 {
@@ -348,6 +499,15 @@ loop:
 						sc.logger.Printf("Next request will timeout in %f seconds\n", when.Seconds())
 					}
 				}
+			}
+		case strm := <-sc.done:
+			// A handler goroutine finished writing its response.
+			strm.processing = false
+			strm.SetState(StreamStateClosed)
+			closeStream(strm)
+
+			if goAwayComplete() {
+				break loop
 			}
 		case fr, ok := <-sc.reader:
 			if !ok {
@@ -374,7 +534,18 @@ loop:
 				}
 
 				if _, ok := closedStrms[fr.Stream()]; ok {
-					if fr.Type() != FramePriority {
+					// Frames legitimately race a RST_STREAM we sent
+					// (RFC 7540 §5.1): the client keeps sending until it
+					// processes the reset. Ignore them — but DATA still
+					// consumed connection flow-control window, so return
+					// that credit. HEADERS on a closed stream remains a
+					// protocol error.
+					switch fr.Type() {
+					case FrameData:
+						sc.replenishConnWindow(fr)
+					case FramePriority, FrameResetStream, FrameWindowUpdate:
+						// ignore
+					default:
 						sc.writeGoAway(fr.Stream(), StreamClosedError, "frame on closed stream")
 					}
 
@@ -403,7 +574,9 @@ loop:
 					continue
 				}
 
-				strm = NewStream(fr.Stream(), int32(sc.clientWindow))
+				// Flow-control windows are tracked via initialStreamWin +
+				// sendQuota under fcMu; the legacy window field is unused.
+				strm = NewStream(fr.Stream(), 0)
 				strms = append(strms, strm)
 
 				// RFC(5.1.1):
@@ -414,6 +587,7 @@ loop:
 				// HEADERS frame and streams that are reserved using PUSH_PROMISE.
 				if fr.Type() == FrameHeaders {
 					openStreams++
+					atomic.AddInt32(&sc.activeStreams, 1)
 					sc.lastID = fr.Stream()
 				}
 
@@ -473,6 +647,21 @@ loop:
 			}
 
 			if err := sc.handleFrame(strm, fr); err != nil {
+				if errors.Is(err, errRequestBodyTooLarge) {
+					// Respond 413 and stop the upload with a complete
+					// response + RST_STREAM(NO_ERROR) (RFC 7540 §8.1).
+					// Later DATA frames hit this branch again and are
+					// dropped; their connection window credit was already
+					// returned in handleFrame.
+					if !strm.processing {
+						strm.processing = true
+						sc.handlersWG.Add(1)
+						go sc.runRejection(strm)
+					}
+
+					continue
+				}
+
 				sc.writeError(strm, err)
 				strm.SetState(StreamStateClosed)
 			}
@@ -481,29 +670,25 @@ loop:
 
 			switch strm.State() {
 			case StreamStateHalfClosed:
-				sc.handleEndRequest(strm)
-				// we fallthrough because once we send the response
-				// the stream is already consumed and thus finished
-				fallthrough
+				// Request fully received — run the handler in its own
+				// goroutine so a slow or streaming response never blocks
+				// frame processing for the other streams on this
+				// connection. The stream is released via sc.done.
+				if !strm.processing {
+					strm.processing = true
+					sc.handlersWG.Add(1)
+					go sc.runHandler(strm)
+				}
 			case StreamStateClosed:
-				closeStream(strm)
+				if strm.processing {
+					// Reset mid-handler: stop the writer, release on done.
+					cancelStream(strm)
+				} else {
+					closeStream(strm)
+				}
 			}
 
-			if isClosing {
-				ref := atomic.LoadUint32(&sc.closeRef)
-				// if there's no reference, then just close the connection
-				if ref == 0 {
-					break
-				}
-
-				// if we have a ref, then check that all streams previous to that ref are closed
-				for _, strm := range strms {
-					// if the stream is here, then it's not closed yet
-					if strm.origType == FrameHeaders && strm.ID() <= ref {
-						continue loop
-					}
-				}
-
+			if isClosing && goAwayComplete() {
 				break loop
 			}
 		}
@@ -519,7 +704,7 @@ func (sc *serverConn) writeReset(strm uint32, code ErrorCode) {
 
 	r.SetCode(code)
 
-	sc.writer <- fr
+	sc.push(fr)
 
 	if sc.debug {
 		sc.logger.Printf(
@@ -540,7 +725,7 @@ func (sc *serverConn) writeGoAway(strm uint32, code ErrorCode, message string) {
 
 	fr.SetBody(ga)
 
-	sc.writer <- fr
+	sc.push(fr)
 
 	if strm != 0 {
 		atomic.StoreUint32(&sc.closeRef, sc.lastID)
@@ -659,6 +844,11 @@ func (sc *serverConn) handleFrame(strm *Stream, fr *FrameHeader) error {
 			strm.ctx.Request.URI().SetSchemeBytes(strm.scheme)
 		}
 	case FrameData:
+		// Connection-level credit is returned even on error paths below:
+		// the bytes were consumed off the wire either way, and without the
+		// credit the connection window would leak shut.
+		sc.replenishConnWindow(fr)
+
 		if !strm.headersFinished {
 			return NewGoAwayError(ProtocolError, "stream didn't end the headers")
 		}
@@ -667,8 +857,14 @@ func (sc *serverConn) handleFrame(strm *Stream, fr *FrameHeader) error {
 			return NewGoAwayError(StreamClosedError, "stream closed")
 		}
 
+		if sc.maxBodySize > 0 && len(strm.ctx.Request.Body())+fr.Len() > sc.maxBodySize {
+			return errRequestBodyTooLarge
+		}
+
 		strm.ctx.Request.AppendBody(
 			fr.Body().(*Data).Data())
+
+		sc.replenishStreamWindow(strm, fr)
 	case FrameResetStream:
 		if strm.State() == StreamStateIdle {
 			return NewGoAwayError(ProtocolError, "RST_STREAM on idle stream")
@@ -691,14 +887,77 @@ func (sc *serverConn) handleFrame(strm *Stream, fr *FrameHeader) error {
 			return NewGoAwayError(ProtocolError, "window increment of 0")
 		}
 
-		if atomic.AddInt64(&strm.window, win) >= 1<<31-1 {
+		sc.fcMu.Lock()
+		strm.sendQuota += win
+		overflow := sc.initialStreamWin+strm.sendQuota >= 1<<31-1
+		sc.fcMu.Unlock()
+
+		if overflow {
 			return NewResetStreamError(FlowControlError, "window is above limits")
 		}
+
+		sc.fcCond.Broadcast()
 	default:
 		return NewGoAwayError(ProtocolError, "invalid frame")
 	}
 
 	return err
+}
+
+// replenishStreamWindow and replenishConnWindow return flow-control credit
+// consumed by a received DATA frame. The request body is buffered
+// immediately, so the full frame length can be credited back right away.
+// Without this the client exhausts the initial windows and stalls: the
+// stream window caps a single request body at maxWindow, and the connection
+// window caps the total body bytes ever received over the connection's
+// lifetime.
+//
+// Flow control counts the whole DATA frame payload including padding, hence
+// fr.Len() rather than the data length.
+//
+// Only called from handleStreams, so sc.currentWindow needs no atomics.
+
+// replenishStreamWindow sends stream-level credit, per frame. Skipped once
+// the client ends the stream — no more DATA can arrive on it.
+func (sc *serverConn) replenishStreamWindow(strm *Stream, fr *FrameHeader) {
+	n := fr.Len()
+	if n <= 0 || fr.Flags().Has(FlagEndStream) {
+		return
+	}
+
+	wu := AcquireFrame(FrameWindowUpdate).(*WindowUpdate)
+	wu.SetIncrement(n)
+
+	wfr := AcquireFrameHeader()
+	wfr.SetStream(strm.ID())
+	wfr.SetBody(wu)
+
+	sc.push(wfr)
+}
+
+// replenishConnWindow sends connection-level credit, batched: refill to
+// maxWindow once half is consumed, mirroring the client side in
+// Conn.readLoop.
+func (sc *serverConn) replenishConnWindow(fr *FrameHeader) {
+	n := int32(fr.Len())
+	if n <= 0 {
+		return
+	}
+
+	sc.currentWindow -= n
+	if sc.currentWindow < sc.maxWindow/2 {
+		inc := sc.maxWindow - sc.currentWindow
+		sc.currentWindow = sc.maxWindow
+
+		wu := AcquireFrame(FrameWindowUpdate).(*WindowUpdate)
+		wu.SetIncrement(int(inc))
+
+		wfr := AcquireFrameHeader()
+		wfr.SetStream(0)
+		wfr.SetBody(wu)
+
+		sc.push(wfr)
+	}
 }
 
 func (sc *serverConn) handleHeaderFrame(strm *Stream, fr *FrameHeader) error {
@@ -794,12 +1053,93 @@ func (sc *serverConn) verifyState(strm *Stream, fr *FrameHeader) error {
 	return nil
 }
 
+// runHandler executes the request handler for strm and writes the response.
+// Runs in its own goroutine so slow handlers and streaming responses never
+// block frame processing for the connection's other streams. Signals
+// completion via sc.done, where the handleStreams loop releases the stream.
+func (sc *serverConn) runHandler(strm *Stream) {
+	defer sc.handlersWG.Done()
+	defer func() {
+		if err := recover(); err != nil {
+			sc.logger.Printf("handler panicked: %s\n%s\n", err, debug.Stack())
+		}
+
+		// done is buffered to maxStreams, so this never blocks.
+		sc.done <- strm
+	}()
+
+	sc.handleEndRequest(strm)
+}
+
+// acquireSendCredit blocks until send flow-control credit is available for
+// strm, then consumes up to max bytes of it and returns the amount taken.
+// Returns 0 when the stream was cancelled or the connection is closing —
+// the caller must stop writing.
+func (sc *serverConn) acquireSendCredit(strm *Stream, max int) int {
+	sc.fcMu.Lock()
+	defer sc.fcMu.Unlock()
+
+	for {
+		if sc.closing || strm.cancelled {
+			return 0
+		}
+
+		avail := sc.initialStreamWin + strm.sendQuota
+		if avail > sc.connSendQuota {
+			avail = sc.connSendQuota
+		}
+
+		if avail > 0 {
+			n := int64(max)
+			if n > avail {
+				n = avail
+			}
+
+			strm.sendQuota -= n
+			sc.connSendQuota -= n
+
+			return int(n)
+		}
+
+		sc.fcCond.Wait()
+	}
+}
+
+// runRejection writes a 413 for a stream whose request body exceeded
+// maxBodySize, then resets the stream with NO_ERROR so the client stops
+// uploading. Runs in its own goroutine; signals completion via sc.done.
+func (sc *serverConn) runRejection(strm *Stream) {
+	defer sc.handlersWG.Done()
+	defer func() {
+		if err := recover(); err != nil {
+			sc.logger.Printf("rejection handler panicked: %s\n%s\n", err, debug.Stack())
+		}
+
+		sc.done <- strm
+	}()
+
+	ctx := strm.ctx
+	ctx.Response.Reset()
+	ctx.SetStatusCode(fasthttp.StatusRequestEntityTooLarge)
+	ctx.SetBodyString("request body too large")
+
+	sc.writeResponse(strm)
+	sc.writeReset(strm.ID(), NoError)
+}
+
 // handleEndRequest dispatches the finished request to the handler.
 func (sc *serverConn) handleEndRequest(strm *Stream) {
 	ctx := strm.ctx
 	ctx.Request.Header.SetProtocolBytes(StringHTTP2)
 
 	sc.h(ctx)
+
+	sc.writeResponse(strm)
+}
+
+// writeResponse writes strm's response headers and body to the client.
+func (sc *serverConn) writeResponse(strm *Stream) {
+	ctx := strm.ctx
 
 	hasBody := ctx.Response.IsBodyStream() || len(ctx.Response.Body()) > 0
 
@@ -812,36 +1152,41 @@ func (sc *serverConn) handleEndRequest(strm *Stream) {
 
 	fr.SetBody(h)
 
+	// The HPACK encoder is stateful: header blocks must reach the writer in
+	// encoding order, so the encode and the enqueue happen under one lock.
+	sc.hpackMu.Lock()
 	fasthttpResponseHeaders(h, &sc.enc, &ctx.Response)
+	pushed := sc.push(fr)
+	sc.hpackMu.Unlock()
 
-	sc.writer <- fr
+	if !pushed || !hasBody {
+		return
+	}
 
-	if hasBody {
-		if ctx.Response.IsBodyStream() {
-			streamWriter := acquireStreamWrite()
-			streamWriter.strm = strm
-			streamWriter.writer = sc.writer
-			streamWriter.size = int64(ctx.Response.Header.ContentLength())
-			_ = ctx.Response.BodyWriteTo(streamWriter)
+	if ctx.Response.IsBodyStream() {
+		streamWriter := acquireStreamWrite()
+		streamWriter.strm = strm
+		streamWriter.sc = sc
+		streamWriter.size = int64(ctx.Response.Header.ContentLength())
+		_ = ctx.Response.BodyWriteTo(streamWriter)
 
-			// For unknown-length streams (chunked), neither ReadFrom nor Write
-			// can reliably set END_STREAM because they don't know when the last
-			// chunk arrives. Send an empty DATA frame with END_STREAM after all
-			// body data has been written.
-			if streamWriter.size < 0 && !streamWriter.endStreamSent {
-				fr := AcquireFrameHeader()
-				fr.SetStream(strm.ID())
-				data := AcquireFrame(FrameData).(*Data)
-				data.SetEndStream(true)
-				data.SetPadding(false)
-				fr.SetBody(data)
-				sc.writer <- fr
-			}
-
-			releaseStreamWrite(streamWriter)
-		} else {
-			sc.writeData(strm, ctx.Response.Body())
+		// For unknown-length streams (chunked), neither ReadFrom nor Write
+		// can reliably set END_STREAM because they don't know when the last
+		// chunk arrives. Send an empty DATA frame with END_STREAM after all
+		// body data has been written.
+		if streamWriter.size < 0 && !streamWriter.endStreamSent {
+			fr := AcquireFrameHeader()
+			fr.SetStream(strm.ID())
+			data := AcquireFrame(FrameData).(*Data)
+			data.SetEndStream(true)
+			data.SetPadding(false)
+			fr.SetBody(data)
+			sc.push(fr)
 		}
+
+		releaseStreamWrite(streamWriter)
+	} else {
+		sc.writeData(strm, ctx.Response.Body())
 	}
 }
 
@@ -863,7 +1208,7 @@ type streamWrite struct {
 	written       int64
 	endStreamSent bool
 	strm          *Stream
-	writer        chan<- *FrameHeader
+	sc            *serverConn
 }
 
 func acquireStreamWrite() *streamWrite {
@@ -884,7 +1229,7 @@ func (s *streamWrite) Reset() {
 	s.written = 0
 	s.endStreamSent = false
 	s.strm = nil
-	s.writer = nil
+	s.sc = nil
 }
 
 func (s *streamWrite) Write(body []byte) (n int, err error) {
@@ -895,41 +1240,51 @@ func (s *streamWrite) Write(body []byte) (n int, err error) {
 		return 0, errors.New("writer closed")
 	}
 
-	step := 1 << 14 // max frame size 16384
-
 	n = len(body)
 	s.written += int64(n)
 
 	// Only set END_STREAM for known-length streams where we've written enough.
 	// Unknown-length streams (size < 0) get END_STREAM from handleEndRequest.
 	end := s.size > 0 && s.written >= s.size
-	for i := 0; i < n; i += step {
-		if i+step >= n {
-			step = n - i
+
+	for i := 0; i < n; {
+		chunk := n - i
+		if chunk > 1<<14 { // max frame size 16384
+			chunk = 1 << 14
+		}
+
+		chunk = s.sc.acquireSendCredit(s.strm, chunk)
+		if chunk == 0 {
+			return i, errors.New("stream closed")
 		}
 
 		fr := AcquireFrameHeader()
 		fr.SetStream(s.strm.ID())
 
 		data := AcquireFrame(FrameData).(*Data)
-		data.SetEndStream(end && i+step == n)
+		data.SetEndStream(end && i+chunk == n)
 		data.SetPadding(false)
-		data.SetData(body[i : step+i])
+		data.SetData(body[i : i+chunk])
 
 		fr.SetBody(data)
 
-		s.writer <- fr
+		if !s.sc.push(fr) {
+			return i, errors.New("connection closed")
+		}
+
+		i += chunk
 	}
 
 	if end {
 		s.endStreamSent = true
 	}
 
-	return len(body), nil
+	return n, nil
 }
 
 func (s *streamWrite) ReadFrom(r io.Reader) (num int64, err error) {
 	buf := copyBufPool.Get().([]byte)
+	defer copyBufPool.Put(buf)
 
 	if s.size < 0 {
 		lrSize := limitedReaderSize(r)
@@ -950,18 +1305,29 @@ func (s *streamWrite) ReadFrom(r io.Reader) (num int64, err error) {
 		if n > 0 {
 			isLast := s.size >= 0 && num+int64(n) >= s.size
 
-			fr := AcquireFrameHeader()
-			fr.SetStream(s.strm.ID())
+			for i := 0; i < n; {
+				chunk := s.sc.acquireSendCredit(s.strm, n-i)
+				if chunk == 0 {
+					return num, errors.New("stream closed")
+				}
 
-			data := AcquireFrame(FrameData).(*Data)
-			data.SetEndStream(isLast)
-			data.SetPadding(false)
-			data.SetData(buf[:n])
-			fr.SetBody(data)
+				fr := AcquireFrameHeader()
+				fr.SetStream(s.strm.ID())
 
-			s.writer <- fr
+				data := AcquireFrame(FrameData).(*Data)
+				data.SetEndStream(isLast && i+chunk == n)
+				data.SetPadding(false)
+				data.SetData(buf[i : i+chunk])
+				fr.SetBody(data)
 
-			num += int64(n)
+				if !s.sc.push(fr) {
+					return num, errors.New("connection closed")
+				}
+
+				i += chunk
+				num += int64(chunk)
+			}
+
 			if isLast {
 				s.endStreamSent = true
 				break
@@ -973,7 +1339,6 @@ func (s *streamWrite) ReadFrom(r io.Reader) (num int64, err error) {
 		}
 	}
 
-	copyBufPool.Put(buf)
 	if errors.Is(err, io.EOF) {
 		return num, nil
 	}
@@ -982,27 +1347,32 @@ func (s *streamWrite) ReadFrom(r io.Reader) (num int64, err error) {
 }
 
 func (sc *serverConn) writeData(strm *Stream, body []byte) {
-	step := 1 << 14 // max frame size 16384
-	if strm.window > 0 && step > int(strm.window) {
-		step = int(strm.window)
-	}
+	for i := 0; i < len(body); {
+		chunk := len(body) - i
+		if chunk > 1<<14 { // max frame size 16384
+			chunk = 1 << 14
+		}
 
-	for i := 0; i < len(body); i += step {
-		if i+step >= len(body) {
-			step = len(body) - i
+		chunk = sc.acquireSendCredit(strm, chunk)
+		if chunk == 0 {
+			return // stream cancelled or connection closing
 		}
 
 		fr := AcquireFrameHeader()
 		fr.SetStream(strm.ID())
 
 		data := AcquireFrame(FrameData).(*Data)
-		data.SetEndStream(i+step == len(body))
+		data.SetEndStream(i+chunk == len(body))
 		data.SetPadding(false)
-		data.SetData(body[i : step+i])
+		data.SetData(body[i : i+chunk])
 
 		fr.SetBody(data)
 
-		sc.writer <- fr
+		if !sc.push(fr) {
+			return
+		}
+
+		i += chunk
 	}
 }
 
@@ -1013,10 +1383,6 @@ func (sc *serverConn) sendPingAndSchedule() {
 }
 
 func (sc *serverConn) writeLoop() {
-	if sc.pingInterval > 0 {
-		sc.pingTimer = time.AfterFunc(sc.pingInterval, sc.sendPingAndSchedule)
-	}
-
 	buffered := 0
 
 	for fr := range sc.writer {
@@ -1032,7 +1398,14 @@ func (sc *serverConn) writeLoop() {
 
 		if err != nil {
 			sc.logger.Printf("ERROR: writeLoop: %s\n", err)
-			// TODO: sc.writer.err <- err
+
+			// The connection is dead, but senders may still be pushing
+			// frames. Keep draining until the writer is closed so they
+			// never block on a full channel that nothing consumes.
+			for fr := range sc.writer {
+				ReleaseFrameHeader(fr)
+			}
+
 			return
 		}
 	}
@@ -1040,10 +1413,20 @@ func (sc *serverConn) writeLoop() {
 
 func (sc *serverConn) handleSettings(st *Settings) {
 	st.CopyTo(&sc.clientS)
-	sc.enc.SetMaxTableSize(sc.clientS.HeaderTableSize())
 
-	// atomically update the new window
-	atomic.StoreInt64(&sc.clientWindow, int64(sc.clientS.MaxWindowSize()))
+	// The HPACK encoder is shared with handler goroutines (hpackMu).
+	sc.hpackMu.Lock()
+	sc.enc.SetMaxTableSize(sc.clientS.HeaderTableSize())
+	sc.hpackMu.Unlock()
+
+	// A new SETTINGS_INITIAL_WINDOW_SIZE adjusts the available window of
+	// every open stream (RFC 7540 §6.9.2). Streams compute their window as
+	// initialStreamWin + sendQuota, so updating the base applies the delta
+	// everywhere at once.
+	sc.fcMu.Lock()
+	sc.initialStreamWin = int64(sc.clientS.MaxWindowSize())
+	sc.fcMu.Unlock()
+	sc.fcCond.Broadcast()
 
 	fr := AcquireFrameHeader()
 
@@ -1052,7 +1435,7 @@ func (sc *serverConn) handleSettings(st *Settings) {
 
 	fr.SetBody(stRes)
 
-	sc.writer <- fr
+	sc.push(fr)
 }
 
 func fasthttpResponseHeaders(dst *Headers, hp *HPACK, res *fasthttp.Response) {

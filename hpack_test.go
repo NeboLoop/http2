@@ -21,9 +21,19 @@ func TestHeaderFieldsToString(t *testing.T) {
 }
 
 func TestAcquireHPACKAndReleaseHPACK(t *testing.T) {
-	hp := &HPACK{}
+	// sync.Pool guarantees no identity round-trip (and deliberately
+	// randomizes under -race), so assert the post-acquire invariant
+	// instead: AcquireHPACK always returns a reset HPACK.
+	hp := AcquireHPACK()
+	hp.SetMaxTableSize(512)
+	hp.DisableCompression = true
 	ReleaseHPACK(hp)
-	http2utils.AssertEqual(t, hp, AcquireHPACK())
+
+	got := AcquireHPACK()
+	http2utils.AssertEqual(t, uint32(defaultHeaderTableSize), got.maxTableSize)
+	http2utils.AssertEqual(t, uint32(defaultHeaderTableSize), got.maxTableSizeSettings)
+	http2utils.AssertEqual(t, false, got.DisableCompression)
+	http2utils.AssertEqual(t, 0, len(got.dynamic))
 }
 
 func TestHPACKAppendInt(t *testing.T) {

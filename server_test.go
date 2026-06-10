@@ -132,15 +132,10 @@ func testIssue52(t *testing.T) {
 		c.bw.Flush()
 	}
 
-	// expect [GOAWAY, RESET, HEADERS, DATA, HEADERS, DATA]
-	expect := []FrameType{
-		FrameGoAway, FrameResetStream, FrameHeaders,
-		FrameData, FrameHeaders, FrameData,
-	}
-
-	for len(expect) != 0 {
-		next := expect[0]
-
+	// expect GOAWAY then RESET, followed by the responses for streams 3 and
+	// 9. Handlers run concurrently, so responses of different streams may
+	// interleave — only per-stream HEADERS-before-DATA order is guaranteed.
+	for _, next := range []FrameType{FrameGoAway, FrameResetStream} {
 		fr, err := c.readNext()
 		if err != nil {
 			t.Fatal(err)
@@ -156,8 +151,40 @@ func testIssue52(t *testing.T) {
 				t.Fatalf("expected RefusedStreamError, got %s", rst.Code())
 			}
 		}
+	}
 
-		expect = expect[1:]
+	sawHeaders := make(map[uint32]bool)
+	sawData := make(map[uint32]bool)
+
+	for i := 0; i < 4; i++ {
+		fr, err := c.readNext()
+		if err != nil {
+			t.Fatal(err)
+		}
+
+		id := fr.Stream()
+		if id != 3 && id != 9 {
+			t.Fatalf("frame on unexpected stream %d", id)
+		}
+
+		switch fr.Type() {
+		case FrameHeaders:
+			if sawHeaders[id] {
+				t.Fatalf("duplicate HEADERS on stream %d", id)
+			}
+			sawHeaders[id] = true
+		case FrameData:
+			if !sawHeaders[id] {
+				t.Fatalf("DATA before HEADERS on stream %d", id)
+			}
+			sawData[id] = true
+		default:
+			t.Fatalf("unexpected frame type %s on stream %d", fr.Type(), id)
+		}
+	}
+
+	if !sawData[3] || !sawData[9] {
+		t.Fatal("missing response DATA for stream 3 and/or 9")
 	}
 
 	_, err = c.readNext()

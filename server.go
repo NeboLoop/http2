@@ -61,6 +61,7 @@ func (s *Server) ServeConn(c net.Conn) error {
 		reader:         make(chan *FrameHeader, 128),
 		maxRequestTime: s.s.ReadTimeout,
 		maxIdleTime:    s.s.IdleTimeout,
+		maxBodySize:    s.s.MaxRequestBodySize,
 		pingInterval:   s.cnf.PingInterval,
 		logger:         s.s.Logger,
 		debug:          s.cnf.Debug,
