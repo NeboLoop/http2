@@ -37,6 +37,17 @@ type Settings struct {
 	windowSize  uint32
 	frameSize   uint32
 	headerSize  uint32
+
+	// seen records which keys were present in the last Read, as a bitmask
+	// of 1<<key. RFC 7540 §6.5.2: settings omitted from a SETTINGS frame
+	// keep their previous value, so receivers must be able to tell "sent
+	// with the default value" from "not sent".
+	seen uint16
+}
+
+// Seen reports whether key was present in the last decoded SETTINGS frame.
+func (st *Settings) Seen(key uint16) bool {
+	return st.seen&(1<<key) != 0
 }
 
 func (st *Settings) Type() FrameType {
@@ -54,6 +65,7 @@ func (st *Settings) Reset() {
 	st.headerSize = 0
 	st.rawSettings = st.rawSettings[:0]
 	st.ack = false
+	st.seen = 0
 }
 
 // CopyTo copies st fields to st2.
@@ -66,6 +78,7 @@ func (st *Settings) CopyTo(st2 *Settings) {
 	st2.windowSize = st.windowSize
 	st2.frameSize = st.frameSize
 	st2.headerSize = st.headerSize
+	st2.seen = st.seen
 }
 
 // SetHeaderTableSize sets the maximum size of the header
@@ -174,6 +187,10 @@ func (st *Settings) Read(d []byte) error {
 		b = d[last:i]
 		key = uint16(b[0])<<8 | uint16(b[1])
 		value = uint32(b[2])<<24 | uint32(b[3])<<16 | uint32(b[4])<<8 | uint32(b[5])
+
+		if key >= HeaderTableSize && key <= MaxHeaderListSize {
+			st.seen |= 1 << key
+		}
 
 		switch key {
 		case HeaderTableSize:

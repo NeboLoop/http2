@@ -389,8 +389,6 @@ func (sc *serverConn) handleStreams() {
 	var reqTimerArmed bool
 	var openStreams int
 
-	closedStrms := make(map[uint32]struct{})
-
 	closeStream := func(strm *Stream) {
 		if strm.origType == FrameHeaders {
 			openStreams--
@@ -399,7 +397,6 @@ func (sc *serverConn) handleStreams() {
 
 		strmID := strm.ID()
 
-		closedStrms[strm.ID()] = struct{}{}
 		strms.Del(strm.ID())
 
 		ctxPool.Put(strm.ctx)
@@ -524,22 +521,17 @@ loop:
 			if strm == nil {
 				// if the stream doesn't exist, create it
 
-				if fr.Type() == FrameResetStream {
-					// only send go away on idle stream not on an already-closed stream
-					if _, ok := closedStrms[fr.Stream()]; !ok {
-						sc.writeGoAway(fr.Stream(), ProtocolError, "RST_STREAM on idle stream")
-					}
-
-					continue
-				}
-
-				if _, ok := closedStrms[fr.Stream()]; ok {
-					// Frames legitimately race a RST_STREAM we sent
-					// (RFC 7540 §5.1): the client keeps sending until it
-					// processes the reset. Ignore them — but DATA still
-					// consumed connection flow-control window, so return
-					// that credit. HEADERS on a closed stream remains a
-					// protocol error.
+				// Stream IDs at or below lastID that are no longer tracked
+				// are closed — explicitly, or implicitly per RFC 7540
+				// §5.1.1 (a higher HEADERS closes lower idle IDs). Frames
+				// legitimately race a RST_STREAM we sent (§5.1): the
+				// client keeps sending until it processes the reset.
+				// Ignore them — but DATA still consumed connection
+				// flow-control window, so return that credit. HEADERS on
+				// a closed stream remains a protocol error. Tracking via
+				// the lastID watermark instead of a closed-streams map
+				// keeps memory flat on long-lived connections.
+				if fr.Stream() <= sc.lastID {
 					switch fr.Type() {
 					case FrameData:
 						sc.replenishConnWindow(fr)
@@ -549,6 +541,11 @@ loop:
 						sc.writeGoAway(fr.Stream(), StreamClosedError, "frame on closed stream")
 					}
 
+					continue
+				}
+
+				if fr.Type() == FrameResetStream {
+					sc.writeGoAway(fr.Stream(), ProtocolError, "RST_STREAM on idle stream")
 					continue
 				}
 
@@ -566,11 +563,6 @@ loop:
 
 					sc.writeReset(fr.Stream(), RefusedStreamError)
 
-					continue
-				}
-
-				if fr.Stream() < sc.lastID {
-					sc.writeGoAway(fr.Stream(), ProtocolError, "stream ID is lower than the latest")
 					continue
 				}
 
@@ -848,6 +840,12 @@ func (sc *serverConn) handleFrame(strm *Stream, fr *FrameHeader) error {
 		// the bytes were consumed off the wire either way, and without the
 		// credit the connection window would leak shut.
 		sc.replenishConnWindow(fr)
+
+		if strm.State() == StreamStateClosed {
+			// We reset this stream (e.g. cancelled mid-handler); the
+			// client's remaining DATA races the RST (RFC 7540 §5.1).
+			return nil
+		}
 
 		if !strm.headersFinished {
 			return NewGoAwayError(ProtocolError, "stream didn't end the headers")
@@ -1412,7 +1410,31 @@ func (sc *serverConn) writeLoop() {
 }
 
 func (sc *serverConn) handleSettings(st *Settings) {
+	// RFC 7540 §6.5.2: settings omitted from a SETTINGS frame keep their
+	// previous value. CopyTo overwrites wholesale, so restore any field the
+	// client didn't actually send — otherwise a later SETTINGS update that
+	// omits INITIAL_WINDOW_SIZE would silently shrink every stream's send
+	// window to the 64KB default.
+	prev := sc.clientS
 	st.CopyTo(&sc.clientS)
+	if !st.Seen(HeaderTableSize) {
+		sc.clientS.tableSize = prev.tableSize
+	}
+	if !st.Seen(EnablePush) {
+		sc.clientS.enablePush = prev.enablePush
+	}
+	if !st.Seen(MaxConcurrentStreams) {
+		sc.clientS.maxStreams = prev.maxStreams
+	}
+	if !st.Seen(MaxWindowSize) {
+		sc.clientS.windowSize = prev.windowSize
+	}
+	if !st.Seen(MaxFrameSize) {
+		sc.clientS.frameSize = prev.frameSize
+	}
+	if !st.Seen(MaxHeaderListSize) {
+		sc.clientS.headerSize = prev.headerSize
+	}
 
 	// The HPACK encoder is shared with handler goroutines (hpackMu).
 	sc.hpackMu.Lock()
