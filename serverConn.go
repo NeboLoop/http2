@@ -482,19 +482,32 @@ loop:
 				closeStream(strm)
 			}
 
-			if len(strms) != 0 && sc.maxRequestTime > 0 {
-				// the first in the stream list might have started with a PushPromise
-				strm := strms.GetFirstOf(FrameHeaders)
-				if strm != nil {
+			// Re-arm the timer only for a stream still RECEIVING its request.
+			// A stream whose handler is already running (processing) is never
+			// timed out here (see the skip above) — but its startedAt is long
+			// past, so arming against it yields a negative deadline that fires
+			// the timer immediately, busy-looping this select at 100% CPU for
+			// the entire life of the long response (SSE, gRPC, LLM streaming).
+			// Pick the oldest not-yet-processing stream instead, clamp to a
+			// positive deadline, and disarm if none remain so the next new
+			// stream re-arms via the reader branch.
+			reqTimerArmed = false
+			if sc.maxRequestTime > 0 {
+				for _, strm := range strms {
+					if strm.origType != FrameHeaders || strm.processing {
+						continue
+					}
 					reqTimerArmed = true
-					// try to arm the timer
 					when := strm.startedAt.Add(sc.maxRequestTime).Sub(time.Now())
-					// if the time is negative or zero it triggers imm
+					if when < time.Millisecond {
+						when = time.Millisecond
+					}
 					sc.maxRequestTimer.Reset(when)
 
 					if sc.debug {
 						sc.logger.Printf("Next request will timeout in %f seconds\n", when.Seconds())
 					}
+					break
 				}
 			}
 		case strm := <-sc.done:
