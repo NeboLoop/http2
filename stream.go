@@ -63,6 +63,15 @@ type Stream struct {
 	// cancelled tells the handler goroutine to stop writing (stream was
 	// reset or the connection is closing). Guarded by serverConn.fcMu.
 	cancelled bool
+
+	// body streams the request body to a handler that runs while it
+	// arrives (fasthttp.Server.StreamRequestBody); nil when the body is
+	// buffered. Owned by the handleStreams loop.
+	body *requestBody
+
+	// slotFreed is set (atomically) once the stream stopped counting
+	// against MaxConcurrentStreams; see serverConn.freeSlot.
+	slotFreed uint32
 }
 
 var streamPool = sync.Pool{
@@ -86,6 +95,8 @@ func NewStream(id uint32, win int32) *Stream {
 	strm.processing = false
 	strm.sendQuota = 0
 	strm.cancelled = false
+	strm.body = nil
+	strm.slotFreed = 0
 
 	return strm
 }

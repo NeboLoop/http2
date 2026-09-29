@@ -87,6 +87,14 @@ func ConfigureClient(c *fasthttp.HostClient, opts ClientOpts) error {
 //   To disable the option you can set it to zero. No value is taken by default,
 //   which means that by default ALL connections are open until either endpoint
 //   closes the connection.
+// - StreamRequestBody: The handler runs as soon as a request's headers
+//   arrive and reads the body from ctx.RequestBodyStream() as DATA frames
+//   come in. Flow control is granted only as the handler reads, so a
+//   connection never holds more than its receive window (1 MiB) of unread
+//   body, whatever the upload size. Without it the whole body is buffered
+//   before the handler runs.
+// - MaxRequestBodySize: A buffered body over it is answered 413; a streamed
+//   one fails the handler's read with fasthttp.ErrBodyTooLarge.
 func ConfigureServer(s *fasthttp.Server, cnf ServerConfig) *Server {
 	cnf.defaults()
 

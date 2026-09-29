@@ -17,7 +17,10 @@ type ServerConfig struct {
 	// To disable pings set the PingInterval to a negative value.
 	PingInterval time.Duration
 
-	// ...
+	// MaxConcurrentStreams caps the request streams one client may have
+	// open at once on a connection. It is advertised as
+	// SETTINGS_MAX_CONCURRENT_STREAMS and a stream opened past it is
+	// refused (REFUSED_STREAM). Defaults to 1024.
 	MaxConcurrentStreams int
 
 	// Debug is a flag that will allow the library to print debugging information.
@@ -62,6 +65,7 @@ func (s *Server) ServeConn(c net.Conn) error {
 		maxRequestTime: s.s.ReadTimeout,
 		maxIdleTime:    s.s.IdleTimeout,
 		maxBodySize:    s.s.MaxRequestBodySize,
+		streamBodies:   s.s.StreamRequestBody,
 		pingInterval:   s.cnf.PingInterval,
 		logger:         s.s.Logger,
 		debug:          s.cnf.Debug,
@@ -74,8 +78,13 @@ func (s *Server) ServeConn(c net.Conn) error {
 	sc.enc.Reset()
 	sc.dec.Reset()
 
-	sc.maxWindow = 1 << 22
-	sc.currentWindow = sc.maxWindow
+	// The receive window, per stream and per connection. With streamed
+	// request bodies it is also the most body a connection holds unread,
+	// whatever the size of its uploads.
+	sc.maxWindow = 1 << 20
+	// The connection window starts at the protocol default and the
+	// handshake's WINDOW_UPDATE adds maxWindow to it.
+	sc.connRecvWindow = int64(defaultWindowSize) + int64(sc.maxWindow)
 
 	sc.st.Reset()
 	sc.st.SetMaxWindowSize(uint32(sc.maxWindow))
