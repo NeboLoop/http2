@@ -13,7 +13,10 @@ env:
 jobs:
   main:
     name: Main Process
-    runs-on: ubuntu-latest
+    # Our runners only (the org's GitHub Actions budget is capped). A fork's
+    # PR never runs on our machines.
+    if: github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository
+    runs-on: [self-hosted, Linux, ARM64, neboloop]
 
     steps:
       - name: Set up Go ${{ env.GO_VERSION }}
