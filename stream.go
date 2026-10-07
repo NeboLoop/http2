@@ -50,6 +50,10 @@ type Stream struct {
 	startedAt       time.Time
 	headersFinished bool
 
+	// readTimeout overrides the server's ReadTimeout for this one request
+	// (fasthttp.Server.HeaderReceived); 0 keeps the server's.
+	readTimeout time.Duration
+
 	// processing is true while the request handler runs in its own
 	// goroutine. Owned by the handleStreams loop.
 	processing bool
@@ -87,6 +91,7 @@ func NewStream(id uint32, win int32) *Stream {
 	strm.state = StreamStateIdle
 	strm.headersFinished = false
 	strm.startedAt = time.Time{}
+	strm.readTimeout = 0
 	strm.previousHeaderBytes = strm.previousHeaderBytes[:0]
 	strm.ctx = nil
 	strm.scheme = []byte("https")

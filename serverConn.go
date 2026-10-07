@@ -108,6 +108,11 @@ type serverConn struct {
 
 	// maxRequestTime is the max time of a request over one single stream
 	maxRequestTime time.Duration
+	// headerReceived is fasthttp.Server.HeaderReceived. Only its
+	// ReadTimeout is honoured here: it replaces maxRequestTime for that one
+	// stream, measured from the stream's start. MaxRequestBodySize and
+	// WriteTimeout are not applied per stream.
+	headerReceived func(*fasthttp.RequestHeader) fasthttp.RequestConfig
 	pingInterval   time.Duration
 	// maxIdleTime is the max time a client can be connected without sending any REQUEST.
 	// As highlighted, PING/PONG frames are completely excluded.
@@ -409,7 +414,6 @@ func (sc *serverConn) handleStreams() {
 	}()
 
 	var strms Streams
-	var reqTimerArmed bool
 
 	// Handlers still reading a request body must not wait on a connection
 	// that is gone (Serve waits for every handler before it closes).
@@ -425,6 +429,48 @@ func (sc *serverConn) handleStreams() {
 	// headers, or a streamed body its handler is already reading.
 	receiving := func(strm *Stream) bool {
 		return !strm.processing || (strm.body != nil && strm.State() == StreamStateOpen)
+	}
+
+	// requestDeadline is when strm's request must have fully arrived: its
+	// own read timeout (headerReceived) or else the server's, from the
+	// stream's start. ok is false when neither is set.
+	requestDeadline := func(strm *Stream) (at time.Time, ok bool) {
+		d := sc.maxRequestTime
+		if strm.readTimeout > 0 {
+			d = strm.readTimeout
+		}
+		if d <= 0 {
+			return time.Time{}, false
+		}
+		return strm.startedAt.Add(d), true
+	}
+
+	// armRequestTimer arms the request timer for the earliest deadline of
+	// the streams still receiving their request, or leaves it disarmed when
+	// none is. A stale fire of the timer is harmless: nothing is due yet,
+	// and the timer re-arms from here.
+	armRequestTimer := func() {
+		var next time.Time
+		for _, strm := range strms {
+			if strm.origType != FrameHeaders || !receiving(strm) {
+				continue
+			}
+			if at, ok := requestDeadline(strm); ok && (next.IsZero() || at.Before(next)) {
+				next = at
+			}
+		}
+		if next.IsZero() {
+			return
+		}
+		when := time.Until(next)
+		if when < time.Millisecond {
+			when = time.Millisecond
+		}
+		sc.maxRequestTimer.Reset(when)
+
+		if sc.debug {
+			sc.logger.Printf("Next request will timeout in %f seconds\n", when.Seconds())
+		}
 	}
 
 	closeStream := func(strm *Stream) {
@@ -500,8 +546,6 @@ loop:
 		case <-sc.closer:
 			break loop
 		case <-sc.maxRequestTimer.C:
-			reqTimerArmed = false
-
 			// maxRequestTime is a read timeout: it only applies to streams
 			// still receiving their request, a streamed body included.
 			// Streams whose request has fully arrived (long responses,
@@ -509,11 +553,12 @@ loop:
 			// owns its own lifetime.
 			var due []*Stream
 			for _, strm := range strms {
-				// the request is due if the startedAt time + maxRequestTime is in the past
-				isDue := time.Now().After(
-					strm.startedAt.Add(sc.maxRequestTime))
-				if !isDue {
-					break
+				// the request is due if its read deadline is in the past.
+				// Deadlines differ per stream (headerReceived), so streams
+				// are not in deadline order: check every one.
+				at, ok := requestDeadline(strm)
+				if !ok || !time.Now().After(at) {
+					continue
 				}
 
 				if !receiving(strm) {
@@ -549,25 +594,7 @@ loop:
 			// Pick the oldest not-yet-processing stream instead, clamp to a
 			// positive deadline, and disarm if none remain so the next new
 			// stream re-arms via the reader branch.
-			reqTimerArmed = false
-			if sc.maxRequestTime > 0 {
-				for _, strm := range strms {
-					if strm.origType != FrameHeaders || !receiving(strm) {
-						continue
-					}
-					reqTimerArmed = true
-					when := strm.startedAt.Add(sc.maxRequestTime).Sub(time.Now())
-					if when < time.Millisecond {
-						when = time.Millisecond
-					}
-					sc.maxRequestTimer.Reset(when)
-
-					if sc.debug {
-						sc.logger.Printf("Next request will timeout in %f seconds\n", when.Seconds())
-					}
-					break
-				}
-			}
+			armRequestTimer()
 		case strm := <-sc.done:
 			// A handler goroutine finished writing its response.
 			strm.processing = false
@@ -671,13 +698,11 @@ loop:
 					sc.logger.Printf("Stream %d created. Open streams: %d\n", strm.ID(), atomic.LoadInt32(&sc.openSlots))
 				}
 
-				if !reqTimerArmed && sc.maxRequestTime > 0 {
-					reqTimerArmed = true
-					sc.maxRequestTimer.Reset(sc.maxRequestTime)
-
-					if sc.debug {
-						sc.logger.Printf("Next request will timeout in %f seconds\n", sc.maxRequestTime.Seconds())
-					}
+				// Re-armed for every new stream: one with a longer read
+				// timeout (headerReceived) may hold the timer past this
+				// stream's deadline.
+				if sc.maxRequestTime > 0 {
+					armRequestTimer()
 				}
 			}
 
@@ -720,7 +745,13 @@ loop:
 				}
 			}
 
-			if err := sc.handleFrame(strm, fr); err != nil {
+			readTimeout := strm.readTimeout
+			err := sc.handleFrame(strm, fr)
+			if strm.readTimeout != readTimeout {
+				// headerReceived gave this request its own read timeout.
+				armRequestTimer()
+			}
+			if err != nil {
 				if errors.Is(err, errRequestBodyTooLarge) {
 					// Respond 413 and stop the upload with a complete
 					// response + RST_STREAM(NO_ERROR) (RFC 7540 §8.1).
@@ -940,6 +971,9 @@ func (sc *serverConn) handleFrame(strm *Stream, fr *FrameHeader) error {
 			// request alone.
 			if !strm.processing {
 				strm.ctx.Request.URI().SetSchemeBytes(strm.scheme)
+				if sc.headerReceived != nil {
+					strm.readTimeout = sc.headerReceived(&strm.ctx.Request.Header).ReadTimeout
+				}
 			}
 		}
 	case FrameData:
