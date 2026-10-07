@@ -63,6 +63,7 @@ func (s *Server) ServeConn(c net.Conn) error {
 		writer:         make(chan *FrameHeader, 128),
 		reader:         make(chan *FrameHeader, 128),
 		maxRequestTime: s.s.ReadTimeout,
+		headerReceived: s.s.HeaderReceived,
 		maxIdleTime:    s.s.IdleTimeout,
 		maxBodySize:    s.s.MaxRequestBodySize,
 		streamBodies:   s.s.StreamRequestBody,
